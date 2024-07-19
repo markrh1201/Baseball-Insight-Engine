@@ -18,3 +18,5 @@ for team in teams:
     schedule = schedule_and_record(2024, team)
     schedule.to_csv(f"{team}_schedule.csv", index=False)
     
+
+    
