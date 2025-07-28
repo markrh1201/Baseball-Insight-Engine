@@ -42,7 +42,7 @@ for filename in os.listdir(directory):
         # Read the CSV file
         df = pd.read_csv(filepath)
         # Calculate the stats
-        team_name = filename.split('_')[0]
+        team_name = filename.split('_')[0].upper()
         win_rate, avg_runs, avg_opp_runs = calculate_stats(df)
         stats[team_name] = {
             'WinRate': win_rate,
@@ -54,12 +54,23 @@ for filename in os.listdir(directory):
 team_stats_filepath = 'combined_team_stats.csv'
 team_stats_df = pd.read_csv(team_stats_filepath)
 
-# Add the stats to the team_stats DataFrame
-team_stats_df['L5%'] = team_stats_df['Team'].apply(lambda team: stats.get(team, {}).get('WinRate', 0))
-team_stats_df['AvgRuns'] = team_stats_df['Team'].apply(lambda team: stats.get(team, {}).get('AvgRuns', 0))
-team_stats_df['AvgOppRuns'] = team_stats_df['Team'].apply(lambda team: stats.get(team, {}).get('AvgOppRuns', 0))
+# Strip whitespace from column names
+team_stats_df.columns = team_stats_df.columns.str.strip()
 
-# Save the updated DataFrame to a new CSV file
-team_stats_df.to_csv('combined_team_stats.csv', index=False)
+# Debug: Print the columns of the DataFrame
+print("Columns in team_stats_df:", team_stats_df.columns)
 
-print("Win rates, average runs per game, and average opponent runs per game added to updated_team_stats.csv successfully!")
+# Check if 'Team' column exists before applying updates
+if 'Team' in team_stats_df.columns:
+    # Add the stats to the team_stats DataFrame
+    team_stats_df['L5%'] = team_stats_df['Team'].apply(lambda team: stats.get(team.upper(), {}).get('WinRate', 0))
+    team_stats_df['AvgRuns'] = team_stats_df['Team'].apply(lambda team: stats.get(team.upper(), {}).get('AvgRuns', 0))
+    team_stats_df['AvgOppRuns'] = team_stats_df['Team'].apply(lambda team: stats.get(team.upper(), {}).get('AvgOppRuns', 0))
+    
+
+    # Save the updated DataFrame to a new CSV file
+    team_stats_df.to_csv('combined_team_stats.csv', index=False)
+
+    print("Win rates, average runs per game, and average opponent runs per game added to combined_team_stats.csv successfully!")
+else:
+    print("Error: 'Team' column not found in the team_stats_df DataFrame.")
