@@ -34,7 +34,7 @@ def scrape_odds_for_date(target_date_str: str):
         if not script_tag:
             return None
 
-        json_data = json.loads(script_tag.string)
+        json_data = json.loads(script_tag.string) # type: ignore
         game_rows = json_data['props']['pageProps']['oddsTables'][0]['oddsTableModel']['gameRows']
         
         if not game_rows:
@@ -53,6 +53,12 @@ def scrape_odds_for_date(target_date_str: str):
 
             home_team = game_view.get('homeTeam', {}).get('displayName', 'N/A')
             away_team = game_view.get('awayTeam', {}).get('displayName', 'N/A')
+            
+            # --- FIX for Athletics naming inconsistency ---
+            if home_team == "Athletics Athletics":
+                home_team = "Athletics"
+            if away_team == "Athletics Athletics":
+                away_team = "Athletics"
             
             if start_date_utc:
                 game_time = datetime.fromisoformat(start_date_utc.replace('Z', '+00:00')).strftime('%Y-%m-%d %I:%M %p ET')
