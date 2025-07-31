@@ -35,58 +35,62 @@ def scrape_odds_for_date(target_date_str: str):
             return None
 
         json_data = json.loads(script_tag.string) # type: ignore
-        game_rows = json_data['props']['pageProps']['oddsTables'][0]['oddsTableModel']['gameRows']
         
-        if not game_rows:
+        all_odds_tables = json_data['props']['pageProps']['oddsTables']
+        if not all_odds_tables:
             return None
 
         extracted_data = []
-        for game in game_rows:
-            game_view = game.get('gameView', {})
+        
+        for odds_table in all_odds_tables:
+            game_rows = odds_table.get('oddsTableModel', {}).get('gameRows', [])
             
-            start_date_utc = game_view.get('startDate', '')
-            
-            # --- FIX: Validate that the game's date matches the requested date ---
-            # This prevents data from other days from leaking into the results.
-            if start_date_utc and pd.to_datetime(start_date_utc).strftime('%Y-%m-%d') != target_date_str:
-                continue # Skip this game as it's not for the target date
+            for game in game_rows:
+                game_view = game.get('gameView', {})
+                
+                # <<< FIX: REMOVED the problematic date validation check here.
+                # The URL parameter already ensures we are on the correct day.
+                
+                start_date_utc = game_view.get('startDate', '')
 
-            home_team = game_view.get('homeTeam', {}).get('displayName', 'N/A')
-            away_team = game_view.get('awayTeam', {}).get('displayName', 'N/A')
-            
-            # --- FIX for Athletics naming inconsistency ---
-            if home_team == "Athletics Athletics":
-                home_team = "Athletics"
-            if away_team == "Athletics Athletics":
-                away_team = "Athletics"
-            
-            if start_date_utc:
-                game_time = datetime.fromisoformat(start_date_utc.replace('Z', '+00:00')).strftime('%Y-%m-%d %I:%M %p ET')
-            else:
-                game_time = f"{target_date_str} Unknown Time"
+                home_team = game_view.get('homeTeam', {}).get('displayName', 'N/A')
+                away_team = game_view.get('awayTeam', {}).get('displayName', 'N/A')
+                
+                if home_team == "Athletics Athletics":
+                    home_team = "Athletics"
+                if away_team == "Athletics Athletics":
+                    away_team = "Athletics"
+                
+                if start_date_utc:
+                    game_time = datetime.fromisoformat(start_date_utc.replace('Z', '+00:00')).strftime('%Y-%m-%d %I:%M %p ET')
+                else:
+                    game_time = f"{target_date_str} Unknown Time"
 
-            consensus = game_view.get('consensus')
-            if consensus and consensus.get('homeMoneyLinePickPercent') is not None:
-                home_wager = f"{consensus.get('homeMoneyLinePickPercent'):.2f}%"
-                away_wager = f"{consensus.get('awayMoneyLinePickPercent'):.2f}%"
-            else:
-                home_wager, away_wager = 'N/A', 'N/A'
-            
-            opening_line = None
-            if game.get('openingLineViews') and game['openingLineViews'][0]:
-                opening_line = game['openingLineViews'][0].get('openingLine')
-            
-            if opening_line:
-                home_opener = opening_line.get('homeOdds', 'N/A')
-                away_opener = opening_line.get('awayOdds', 'N/A')
-            else:
-                home_opener, away_opener = 'N/A', 'N/A'
+                consensus = game_view.get('consensus')
+                if consensus and consensus.get('homeMoneyLinePickPercent') is not None:
+                    home_wager = f"{consensus.get('homeMoneyLinePickPercent'):.2f}%"
+                    away_wager = f"{consensus.get('awayMoneyLinePickPercent'):.2f}%"
+                else:
+                    home_wager, away_wager = 'N/A', 'N/A'
+                
+                opening_line = None
+                if game.get('openingLineViews') and game['openingLineViews'][0]:
+                    opening_line = game['openingLineViews'][0].get('openingLine')
+                
+                if opening_line:
+                    home_opener = opening_line.get('homeOdds', 'N/A')
+                    away_opener = opening_line.get('awayOdds', 'N/A')
+                else:
+                    home_opener, away_opener = 'N/A', 'N/A'
 
-            extracted_data.append([
-                game_time, home_team, away_team,
-                home_wager, away_wager, home_opener, away_opener
-            ])
-            
+                extracted_data.append([
+                    game_time, home_team, away_team,
+                    home_wager, away_wager, home_opener, away_opener
+                ])
+                
+        if not extracted_data:
+            return None
+
         return pd.DataFrame(extracted_data, columns=[
             'Game Time', 'Home Team', 'Away Team', 
             'Home Wager %', 'Away Wager %', 
@@ -105,50 +109,73 @@ if __name__ == "__main__":
     MAX_WORKERS = 6
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    output_path = os.path.join(OUTPUT_DIR, OUTPUT_FILENAME)
 
-    start_date = date(START_YEAR, 1, 1)
+    # --- Determine which dates need to be scraped ---
+
+    # 1. Generate all possible dates from the start year to today's date
+    start_date = date(START_YEAR, 3, 1) # Start with MLB season
     end_date = date.today()
     date_range = pd.date_range(start_date, end_date)
     
-    all_odds_dfs = []
+    # Filter for the MLB season months (March-November)
+    all_possible_dates = {d.strftime('%Y-%m-%d') for d in date_range if d.month in range(3, 12)}
     
-    dates_to_scrape = [
-        d.strftime('%Y-%m-%d') for d in date_range if d.month in range(3, 12)
-    ]
-
-    print(f"Starting to scrape MLB odds for {len(dates_to_scrape)} days using up to {MAX_WORKERS} parallel workers...")
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        results = list(tqdm(executor.map(scrape_odds_for_date, dates_to_scrape), total=len(dates_to_scrape)))
-
-    for daily_df in results:
-        if daily_df is not None and not daily_df.empty:
-            all_odds_dfs.append(daily_df)
-
-    if all_odds_dfs:
-        print("\nCombining all collected data...")
-        master_odds_df = pd.concat(all_odds_dfs, ignore_index=True)
-        
-        print("Processing N/A values...")
-        
-        for col in ['Home Wager %', 'Away Wager %']:
-            numeric_col = pd.to_numeric(master_odds_df[col].str.replace('%', ''), errors='coerce')
-            mean_value = numeric_col.mean()
-            master_odds_df[col] = numeric_col.fillna(mean_value).map('{:.2f}%'.format)
-            print(f"  - Filled N/A values in '{col}' with mean: {mean_value:.2f}%")
-
-        for col in ['Home Opener Odds', 'Away Opener Odds']:
-            numeric_col = pd.to_numeric(master_odds_df[col], errors='coerce')
-            master_odds_df[col] = numeric_col.fillna(0).astype(int)
-            print(f"  - Filled N/A values in '{col}' with 0.")
-
-        output_path = os.path.join(OUTPUT_DIR, OUTPUT_FILENAME)
-        master_odds_df.to_csv(output_path, index=False)
-        
-        print("\n--- Scraping Complete! ---")
-        print(f"✅ Full dataset with {len(master_odds_df)} games saved to '{output_path}'")
-        print("\n--- Sample of the Final DataFrame ---")
-        print(master_odds_df.head())
+    # 2. If the file exists, find out which dates are already saved
+    existing_df = pd.DataFrame()
+    if os.path.exists(output_path):
+        print(f"Reading existing data from '{output_path}'...")
+        try:
+            existing_df = pd.read_csv(output_path)
+            # Reliably parse dates from the 'Game Time' column
+            scraped_dates = set(pd.to_datetime(existing_df['Game Time']).dt.strftime('%Y-%m-%d'))
+            print(f"Found {len(scraped_dates)} previously scraped dates.")
+        except (pd.errors.EmptyDataError, KeyError):
+            print("⚠️ Existing file is empty or invalid. Starting a fresh scrape.")
+            scraped_dates = set()
     else:
+        print("No existing data file found. Starting a new scrape.")
+        scraped_dates = set()
+
+    # 3. Determine the final list of dates to scrape
+    dates_to_scrape = sorted(list(all_possible_dates - scraped_dates))
+
+    # --- Execute Scraping ---
+
+    if not dates_to_scrape:
         print("\n--- Scraping Complete ---")
-        print("No game data was found in the specified date range.")
+        print("✅ All dates up to today are already in the dataset. No new data to scrape.")
+    else:
+        print(f"\nFound {len(dates_to_scrape)} new day(s) to scrape...")
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            results = list(tqdm(executor.map(scrape_odds_for_date, dates_to_scrape), total=len(dates_to_scrape)))
+
+        newly_scraped_dfs = [df for df in results if df is not None and not df.empty]
+
+        if newly_scraped_dfs:
+            print("\nProcessing and combining new data...")
+            new_master_df = pd.concat(newly_scraped_dfs, ignore_index=True)
+            
+            # Process N/A values for the newly scraped data
+            for col in ['Home Opener Odds', 'Away Opener Odds']:
+                numeric_col = pd.to_numeric(new_master_df[col], errors='coerce')
+                new_master_df[col] = numeric_col.fillna(0).astype(int)
+            
+            # Combine old and new dataframes
+            final_df = pd.concat([existing_df, new_master_df], ignore_index=True)
+
+            # Sort the final dataset by game time for consistency
+            final_df['Game Time'] = pd.to_datetime(final_df['Game Time'])
+            final_df = final_df.sort_values(by='Game Time').reset_index(drop=True)
+            
+            # Save the updated complete dataset
+            final_df.to_csv(output_path, index=False)
+            
+            print("\n--- Scraping Complete! ---")
+            print(f"✅ Appended {len(new_master_df)} new games. Full dataset with {len(final_df)} games saved to '{output_path}'")
+            print("\n--- Sample of the Latest Data ---")
+            print(final_df.tail()) # Use .tail() to show the most recent entries
+        else:
+            print("\n--- Scraping Complete ---")
+            print("No new game data was found for the missing dates.")

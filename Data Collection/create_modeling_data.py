@@ -8,22 +8,21 @@ def create_modeling_dataset():
     Combines schedule, stats, and odds data. It separates completed games
     for training and today's upcoming games for testing.
     """
-    
     # --- File Paths ---
     RAW_DATA_DIR = 'raw_data'
     PROCESSED_DATA_DIR = 'processed_data'
     OUTPUT_DIR = 'modeling_data'
-    
+
     SCHEDULE_PATH = os.path.join(RAW_DATA_DIR, 'schedule_data.csv')
     HITTING_STATS_PATH = os.path.join(PROCESSED_DATA_DIR, 'team_hitting_stats.csv')
     PITCHING_STATS_PATH = os.path.join(PROCESSED_DATA_DIR, 'team_pitching_stats.csv')
     ODDS_PATH = os.path.join(PROCESSED_DATA_DIR, 'mlb_odds_2022_present.csv')
-    
+
     # Create output directory if it doesn't exist
     if not os.path.exists(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR)
         
-    # --- Team Name Mappings (Corrected for consistency) ---
+    # --- Team Name Mappings ---
     team_name_map = {
         'Atlanta Braves': 'ATL', 'Miami Marlins': 'MIA', 'New York Mets': 'NYM',
         'Philadelphia Phillies': 'PHI', 'Washington Nationals': 'WSN', 'Chicago Cubs': 'CHC',
@@ -59,32 +58,31 @@ def create_modeling_dataset():
     pitching_df = pd.read_csv(PITCHING_STATS_PATH)
     odds_df = pd.read_csv(ODDS_PATH)
 
-    # Prepare schedule data
+    # Prepare schedule data (The source of truth for home/away teams)
     schedule_df['game_date'] = pd.to_datetime(schedule_df['game_date'])
     schedule_df['year'] = schedule_df['game_date'].dt.year
-    schedule_df['home_team'] = schedule_df['home_name'].map(team_name_map)
-    schedule_df['away_team'] = schedule_df['away_name'].map(team_name_map)
+    schedule_df['home_team'] = schedule_df['home_name'].str.strip().map(team_name_map)
+    schedule_df['away_team'] = schedule_df['away_name'].str.strip().map(team_name_map)
 
-    # Prepare odds data
-    odds_df['game_date'] = pd.to_datetime(odds_df['Game Time'].str.split(' ').str[0])
-    odds_df['home_team'] = odds_df['Home Team'].map(odds_team_name_map)
-    odds_df['away_team'] = odds_df['Away Team'].map(odds_team_name_map)
-    odds_df = odds_df[['game_date', 'home_team', 'away_team', 'Home Opener Odds', 'Away Opener Odds']].copy()
+    # <<< FIX: Prepare odds data with a temporary, order-independent merge key >>>
+    odds_df['game_date'] = pd.to_datetime(pd.to_datetime(odds_df['Game Time']).dt.tz_localize('UTC').dt.tz_convert('US/Eastern').dt.date)
+    odds_df['odds_home_team'] = odds_df['Home Team'].str.strip().map(odds_team_name_map)
+    odds_df['odds_away_team'] = odds_df['Away Team'].str.strip().map(odds_team_name_map)
+    odds_df.dropna(subset=['odds_home_team', 'odds_away_team'], inplace=True)
+    odds_df['merge_key'] = odds_df.apply(lambda row: '_'.join(sorted([row['odds_home_team'], row['odds_away_team']])) + '_' + row['game_date'].strftime('%Y-%m-%d'), axis=1)
 
     # --- 2. Split Data into Training (Completed) and Testing (Today's Games) ---
     print("Splitting data into training and testing sets...")
     
-    # Training data: All games with a recorded winner
     training_schedule = schedule_df[schedule_df['winning_team'].notna()].copy()
     training_schedule['home_team_won'] = (training_schedule['home_score'] > training_schedule['away_score']).astype(int)
     
-    # Testing data: Today's games that are not yet finished
     today_str = datetime.now().strftime('%Y-%m-%d')
     todays_games_mask = (schedule_df['game_date'].dt.strftime('%Y-%m-%d') == today_str)
     status_mask = schedule_df['status'].isin(['Scheduled', 'Pre-Game', 'Delayed Start: Rain'])
     testing_schedule = schedule_df[todays_games_mask & status_mask].copy()
     if not testing_schedule.empty:
-        testing_schedule['home_team_won'] = np.nan # Target is unknown
+        testing_schedule['home_team_won'] = np.nan
 
     print(f"Found {len(training_schedule)} completed games for the training set.")
     print(f"Found {len(testing_schedule)} upcoming games for today's testing set.")
@@ -92,51 +90,52 @@ def create_modeling_dataset():
     # --- 3. Define a Reusable Merging Function ---
     def merge_game_data(df, hitting_stats, pitching_stats, odds_data):
         if df.empty:
-            return pd.DataFrame() # Return empty df if no games
+            return pd.DataFrame()
             
         base_cols = ['game_id', 'game_date', 'year', 'home_team', 'away_team', 'home_team_won']
         games = df[base_cols].copy()
+        games.dropna(subset=['home_team', 'away_team'], inplace=True)
 
-        # Merge hitting stats
+        # <<< FIX: Create the same temporary merge key on the schedule data >>>
+        # This key is order-independent and does NOT change the original home/away columns.
+        games['merge_key'] = games.apply(lambda row: '_'.join(sorted([row['home_team'], row['away_team']])) + '_' + row['game_date'].strftime('%Y-%m-%d'), axis=1)
+
+        # Merge hitting and pitching stats
         merged = pd.merge(games, hitting_stats, left_on=['year', 'home_team'], right_on=['year', 'Team'], how='left')
         merged = pd.merge(merged, hitting_stats, left_on=['year', 'away_team'], right_on=['year', 'Team'], how='left', suffixes=('_home_hitting', '_away_hitting'))
-        
-        # Merge pitching stats
         merged = pd.merge(merged, pitching_stats, left_on=['year', 'home_team'], right_on=['year', 'Team'], how='left')
         merged = pd.merge(merged, pitching_stats, left_on=['year', 'away_team'], right_on=['year', 'Team'], how='left', suffixes=('_home_pitching', '_away_pitching'))
         
-        # Merge odds data
-        final = pd.merge(merged, odds_data, on=['game_date', 'home_team', 'away_team'], how='left')
+        # <<< FIX: Merge odds using the temporary key >>>
+        final = pd.merge(merged, odds_data, on='merge_key', how='left', suffixes=('', '_odds'))
 
-        # Clean up redundant columns
-        final = final.drop(columns=[col for col in final.columns if 'Team_' in str(col)])
+        # <<< FIX: Assign odds correctly based on the true home team from the schedule >>>
+        # This checks if the home team in the schedule matches the home team in the odds file and assigns odds accordingly.
+        final['Home Opener Odds'] = np.where(final['home_team'] == final['odds_home_team'], final['Home Opener Odds'], final['Away Opener Odds'])
+        final['Away Opener Odds'] = np.where(final['home_team'] == final['odds_home_team'], final['Away Opener Odds'], final['Home Opener Odds'])
+        
+        # Drop temporary and redundant columns for a clean final dataset
+        final.drop(columns=[col for col in final.columns if 'Team_' in str(col) or '_odds' in str(col) or col == 'merge_key'], inplace=True)
         return final
 
     # --- 4. Process and Save Datasets ---
-    # Process training data
-    training_data = merge_game_data(training_schedule, hitting_df, pitching_df, odds_df)
-    if not training_data.empty:
-        initial_rows = len(training_data)
-        training_data.dropna(inplace=True) # Drop any rows with missing features for clean training
-        training_data.reset_index(drop=True, inplace=True)
+    for data_type, schedule_data in [('training', training_schedule), ('testing', testing_schedule)]:
+        if schedule_data.empty:
+            continue
         
-        output_path = os.path.join(OUTPUT_DIR, 'training_dataset.csv')
-        training_data.to_csv(output_path, index=False)
-        print(f"\n✅ Training data created successfully. Dropped {initial_rows - len(training_data)} rows with missing values.")
-        print(f"   Saved to: {output_path}")
-
-    # Process testing data
-    testing_data = merge_game_data(testing_schedule, hitting_df, pitching_df, odds_df)
-    if not testing_data.empty:
-        # For testing data, we keep all games, even if some features (like odds) are missing
-        testing_data.reset_index(drop=True, inplace=True)
+        print(f"\nProcessing {data_type} data...")
+        final_data = merge_game_data(schedule_data, hitting_df, pitching_df, odds_df)
         
-        output_path = os.path.join(OUTPUT_DIR, 'testing_dataset.csv')
-        testing_data.to_csv(output_path, index=False)
-        print(f"\n✅ Testing data for today's games created successfully.")
-        print(f"   Saved to: {output_path}")
-        if testing_data.isnull().any().any():
-            print("   (Note: Testing data may contain NaNs for features that are not yet available, like odds).")
-
+        if not final_data.empty:
+            if data_type == 'training':
+                initial_rows = len(final_data)
+                final_data.dropna(inplace=True) # Drop rows with any missing features for clean training
+                print(f"   Dropped {initial_rows - len(final_data)} rows with missing values.")
+            
+            final_data.reset_index(drop=True, inplace=True)
+            output_path = os.path.join(OUTPUT_DIR, f'{data_type}_dataset.csv')
+            final_data.to_csv(output_path, index=False)
+            print(f"✅ {data_type.capitalize()} data created successfully.")
+            print(f"   Saved {len(final_data)} games to: {output_path}")
 if __name__ == '__main__':
     create_modeling_dataset()
